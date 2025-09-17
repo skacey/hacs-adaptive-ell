@@ -1,0 +1,13 @@
+{
+  "domain": "adaptive_ell",
+  "name": "Adaptive Estimated Light Level",
+  "version": "0.1.0",
+  "documentation": "https://github.com/skacey/hacs-adaptive-ell",
+  "issue_tracker": "https://github.com/skacey/hacs-adaptive-ell/issues",
+  "dependencies": [],
+  "codeowners": ["@skacey"],
+  "requirements": [],
+  "iot_class": "calculated",
+  "config_flow": true,
+  "integration_type": "helper"
+}
