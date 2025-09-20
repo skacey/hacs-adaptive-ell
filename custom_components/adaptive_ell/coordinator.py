@@ -21,7 +21,7 @@ _LOGGER = logging.getLogger(__name__)
 # Hardcoded test configuration for Office
 OFFICE_TEST_CONFIG = {
     "room_name": "office",
-    "sensor_entity": "sensor.third_reality_multi_function_night_light_illuminance",
+    "sensor_entity": "sensor.andon_sensor_illuminance",
     "lights": [
         "light.office_main_lights",
         "light.andon_office_light", 
