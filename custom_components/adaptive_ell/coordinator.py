@@ -14,7 +14,8 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN, DEFAULT_UPDATE_INTERVAL
+from datetime import timedelta
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=DEFAULT_UPDATE_INTERVAL,
+            update_interval=timedelta(seconds=300), # 5 minutes
         )
         
         # Calibration state
