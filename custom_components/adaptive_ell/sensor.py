@@ -8,7 +8,7 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import UnitOfIlluminance
+from homeassistant.const import LIGHT_LUX
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -45,7 +45,7 @@ class AdaptiveELLSensor(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = f"adaptive_ell_{coordinator.room_name}"
         self._attr_device_class = SensorDeviceClass.ILLUMINANCE
         self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_native_unit_of_measurement = UnitOfIlluminance.LUX
+        self._attr_native_unit_of_measurement = LIGHT_LUX
         self._attr_icon = "mdi:lightbulb-on"
 
     @property
