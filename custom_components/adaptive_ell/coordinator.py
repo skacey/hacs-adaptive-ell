@@ -251,7 +251,7 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         
         _LOGGER.info("Min lux: %.1f, Max lux: %.1f", self.min_lux, self.max_lux)
 
-    async def _test_light_contributions(self) -> None:
+async def _test_light_contributions(self) -> None:
         """Test individual light contributions."""
         self.calibration_step = "testing_contributions"
         
@@ -282,13 +282,46 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             
             # Calculate contribution
             max_contribution = light_100_reading - self.min_lux
+            
+            # Skip lights with no measurable contribution
+            if max_contribution <= 0:
+                _LOGGER.warning(
+                    "Light %s has no measurable contribution (%.1f lux), skipping",
+                    light_entity, max_contribution
+                )
+                continue
+            
+            # Calculate linearity with better error handling
             expected_50_contribution = max_contribution * 0.5 + self.min_lux
-            linearity_error = abs(light_50_reading - expected_50_contribution) / max_contribution
+            linearity_error = 0
+            linear_validated = False
+            
+            # Avoid division by zero and provide detailed diagnostics
+            if max_contribution > 1:  # Only test linearity if contribution is significant
+                linearity_error = abs(light_50_reading - expected_50_contribution) / max_contribution
+                linear_validated = linearity_error < 0.05  # Within 5%
+                
+                _LOGGER.info(
+                    "Light %s linearity test: Expected %.1f lux at 50%%, Actual %.1f lux, Error %.1f%% (%s)",
+                    light_entity, expected_50_contribution, light_50_reading, 
+                    linearity_error * 100, "PASS" if linear_validated else "FAIL"
+                )
+            else:
+                _LOGGER.warning(
+                    "Light %s contribution too small for linearity testing (%.1f lux)",
+                    light_entity, max_contribution
+                )
             
             self.light_contributions[light_entity] = {
                 "max_contribution": max_contribution,
-                "linear_validated": linearity_error < 0.05,  # Within 5%
-                "linearity_error": linearity_error
+                "linear_validated": linear_validated,
+                "linearity_error": linearity_error,
+                "readings": {
+                    "min_lux": self.min_lux,
+                    "light_100_reading": light_100_reading,
+                    "light_50_reading": light_50_reading,
+                    "expected_50": expected_50_contribution
+                }
             }
             
             _LOGGER.info(
