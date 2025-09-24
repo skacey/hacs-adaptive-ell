@@ -6,7 +6,6 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
 from .coordinator import AdaptiveELLCoordinator
@@ -20,7 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Adaptive ELL from a config entry."""
     
     # Create coordinator
-    coordinator = AdaptiveELLCoordinator(hass)
+    coordinator = AdaptiveELLCoordinator(hass, entry)
     
     # Initial data fetch
     await coordinator.async_config_entry_first_refresh()
@@ -50,9 +49,9 @@ async def _async_register_services(hass: HomeAssistant, coordinator: AdaptiveELL
     """Register integration services."""
     
     async def start_calibration(call):
-        """Start calibration service."""
+        """Start calibration service - reads configuration from integration options."""
         try:
-            await coordinator.start_calibration()
+            await coordinator.start_calibration_from_options()
         except Exception as err:
             _LOGGER.error("Failed to start calibration: %s", err)
     
