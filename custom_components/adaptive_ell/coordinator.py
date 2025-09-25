@@ -133,17 +133,21 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
     async def _get_configuration_from_options(self) -> Dict[str, Any]:
         """Read configuration from integration options."""
         options = self.config_entry.options
-        
+
+        _LOGGER.info("Debug: Config entry options: %s", options)
+
         if not options:
             raise HomeAssistantError("No configuration found - use integration options to configure")
         
         # Get test area information
         test_area_id = options.get("test_area")
+        _LOGGER.info("Debug: test_area_id from options: %s", test_area_id)
         if not test_area_id:
             raise HomeAssistantError("No test area configured")
         
         area_reg = area_registry.async_get(self.hass)
         test_area = area_reg.areas.get(test_area_id)
+        _LOGGER.info("Debug: Found test_area object: %s", test_area)
         if not test_area:
             raise HomeAssistantError(f"Test area {test_area_id} not found")
         
@@ -178,6 +182,13 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         ent_reg = entity_registry.async_get(self.hass)
         lights = []
         
+        _LOGGER.info("Debug: Looking for lights in areas: %s", [area.name for area in areas])
+        for area in areas:
+            _LOGGER.info("Debug: Area %s (ID: %s) lights:", area.name, area.id)
+            area_lights = [entity.entity_id for entity in ent_reg.entities.values() 
+                           if entity.area_id == area.id and entity.entity_id.startswith("light.")]
+            _LOGGER.info("Debug: Found lights: %s", area_lights)
+
         for area in areas:
             # Find lights in this area
             for entity in ent_reg.entities.values():
