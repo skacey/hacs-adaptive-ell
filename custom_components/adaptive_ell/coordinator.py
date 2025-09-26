@@ -13,7 +13,7 @@ from homeassistant.const import STATE_ON, STATE_OFF, STATE_UNAVAILABLE, STATE_UN
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.helpers import area_registry, entity_registry
+from homeassistant.helpers import area_registry, entity_registry, device_registry
 
 from .const import DOMAIN
 
@@ -208,30 +208,54 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         """Get all light entities from specified areas with extensive debugging."""
         try:
             ent_reg = entity_registry.async_get(self.hass)
+            dev_reg = device_registry.async_get(self.hass)
             lights = []
             
             _LOGGER.error("=== LIGHT DISCOVERY DEBUG START ===")
             _LOGGER.error("Entity registry has %d total entities", len(ent_reg.entities))
+            _LOGGER.error("Device registry has %d total devices", len(dev_reg.devices))
             _LOGGER.error("Looking for lights in %d areas: %s", len(areas), [area.name for area in areas])
             
             # Debug: Show all light entities in the system
             all_light_entities = [e for e in ent_reg.entities.values() if e.entity_id.startswith("light.")]
             _LOGGER.error("Total light entities in system: %d", len(all_light_entities))
             
-            for light in all_light_entities[:5]:  # Show first 5 for debugging
-                _LOGGER.error("Sample light: %s, area_id: %s, disabled: %s", 
-                            light.entity_id, light.area_id, light.disabled)
+            # Debug: Show sample lights with their device and area info
+            for light in all_light_entities[:5]:
+                device = None
+                device_area = "No Device"
+                if light.device_id:
+                    device = dev_reg.devices.get(light.device_id)
+                    if device and device.area_id:
+                        device_area = device.area_id
+                _LOGGER.error("Sample light: %s, device_id: %s, device_area: %s, disabled: %s", 
+                            light.entity_id, light.device_id, device_area, light.disabled)
             
             # Check each area
+            area_ids = [area.id for area in areas]
+            _LOGGER.error("Target area IDs: %s", area_ids)
+            
             for area in areas:
                 _LOGGER.error("--- Checking area: %s (ID: %s) ---", area.name, area.id)
                 area_light_count = 0
                 
                 for entity in ent_reg.entities.values():
-                    # Check if this entity belongs to current area and is a light
-                    if entity.area_id == area.id and entity.entity_id.startswith("light."):
+                    # Only check light entities
+                    if not entity.entity_id.startswith("light."):
+                        continue
+                    
+                    # Get the device for this entity
+                    entity_area_id = None
+                    if entity.device_id:
+                        device = dev_reg.devices.get(entity.device_id)
+                        if device:
+                            entity_area_id = device.area_id
+                    
+                    # Check if this entity's device is in the current area
+                    if entity_area_id == area.id:
                         area_light_count += 1
-                        _LOGGER.error("Found light in area: %s (disabled: %s)", entity.entity_id, entity.disabled)
+                        _LOGGER.error("Found light in area: %s (disabled: %s, device_id: %s)", 
+                                    entity.entity_id, entity.disabled, entity.device_id)
                         
                         # Only add if not disabled
                         if not entity.disabled:
@@ -245,7 +269,15 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
                         else:
                             _LOGGER.error("Skipping disabled light: %s", entity.entity_id)
                 
-                _LOGGER.error("Area %s summary: %d total lights, %d will be tested", area.name, area_light_count, len([l for l in lights if any(e.entity_id == l and e.area_id == area.id for e in ent_reg.entities.values())]))
+                _LOGGER.error("Area %s summary: %d total lights, %d will be tested", 
+                            area.name, area_light_count, 
+                            len([l for l in lights if any(
+                                ent_reg.entities.get(l) and 
+                                ent_reg.entities.get(l).device_id and
+                                dev_reg.devices.get(ent_reg.entities.get(l).device_id) and
+                                dev_reg.devices.get(ent_reg.entities.get(l).device_id).area_id == area.id
+                                for l in [l]
+                            )]))
             
             _LOGGER.error("=== LIGHT DISCOVERY DEBUG END ===")
             _LOGGER.error("Final light list (%d lights): %s", len(lights), lights)
