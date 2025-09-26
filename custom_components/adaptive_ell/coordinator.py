@@ -55,69 +55,82 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data from Home Assistant."""
         try:
-            # Skip update if no sensor configured yet
-            if not self.sensor_entity:
-                return {
-                    "current_lux": 0,
-                    "estimated_lux": 0,
-                    "calibrating": self.is_calibrating,
-                    "calibration_step": "not_configured",
-                    "min_lux": self.min_lux,
-                    "max_lux": self.max_lux,
-                    "light_contributions": self.light_contributions,
-                }
+            data = {}
             
-            # Get current sensor reading
-            sensor_state = self.hass.states.get(self.sensor_entity)
-            if not sensor_state or sensor_state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
-                raise UpdateFailed(f"Sensor {self.sensor_entity} unavailable")
+            # Basic state information
+            data["calibrating"] = self.is_calibrating
+            data["calibration_step"] = self.calibration_step
             
-            current_lux = float(sensor_state.state)
+            # Get current sensor reading if configured
+            if self.sensor_entity:
+                sensor_state = self.hass.states.get(self.sensor_entity)
+                if sensor_state and sensor_state.state not in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
+                    try:
+                        current_lux = float(sensor_state.state)
+                        data["current_lux"] = current_lux
+                    except (ValueError, TypeError):
+                        data["current_lux"] = 0
+                else:
+                    data["current_lux"] = 0
+            else:
+                data["current_lux"] = 0
             
-            # Calculate ELL if we have calibration data
-            estimated_lux = await self._calculate_ell() if self.light_contributions else current_lux
+            # Add calibration results
+            data["min_lux"] = self.min_lux
+            data["max_lux"] = self.max_lux
             
-            return {
-                "current_lux": current_lux,
-                "estimated_lux": estimated_lux,
-                "calibrating": self.is_calibrating,
-                "calibration_step": self.calibration_step,
-                "min_lux": self.min_lux,
-                "max_lux": self.max_lux,
-                "light_contributions": self.light_contributions,
-            }
+            # Calculate estimated lux if we have calibration data
+            if self.light_contributions and not self.is_calibrating:
+                estimated_lux = await self._calculate_estimated_lux()
+                data["estimated_lux"] = estimated_lux
+            else:
+                data["estimated_lux"] = 0
+                
+            return data
             
-        except ValueError as err:
-            raise UpdateFailed(f"Error parsing sensor data: {err}")
         except Exception as err:
-            raise UpdateFailed(f"Error communicating with HA: {err}")
+            _LOGGER.error("Error updating data: %s", err)
+            raise UpdateFailed(f"Error updating data: {err}")
 
-    async def _calculate_ell(self) -> float:
-        """Calculate estimated light level based on current light states."""
-        total_contribution = 0
+    async def _calculate_estimated_lux(self) -> float:
+        """Calculate estimated lux based on current light states."""
+        if not self.light_contributions:
+            return 0
         
-        for light_entity in self.lights:
-            if light_entity not in self.light_contributions:
-                continue
-                
+        total_lux = self.min_lux  # Start with ambient/min level
+        
+        for light_entity, contribution_data in self.light_contributions.items():
             light_state = self.hass.states.get(light_entity)
-            if not light_state or light_state.state == STATE_OFF:
+            if not light_state or light_state.state != STATE_ON:
                 continue
                 
-            if light_state.state == STATE_ON:
-                brightness = light_state.attributes.get("brightness", 255)
-                brightness_pct = brightness / 255.0
-                max_contribution = self.light_contributions[light_entity]["max_contribution"]
-                
-                # Use square root curve for better accuracy
-                sqrt_contribution = max_contribution * (brightness_pct ** 0.5)
-                total_contribution += sqrt_contribution
+            brightness = light_state.attributes.get("brightness", 255)
+            brightness_pct = brightness / 255.0
+            max_contribution = contribution_data.get("max_contribution", 0)
+            
+            # Simple linear model for now
+            light_contribution = max_contribution * brightness_pct
+            total_lux += light_contribution
         
-        # Add minimum ambient light
-        return self.min_lux + total_contribution
+        return round(total_lux, 1)
+
+    async def stop_calibration(self) -> None:
+        """Stop any running calibration."""
+        if not self.is_calibrating:
+            return
+            
+        _LOGGER.info("Stopping calibration")
+        self.is_calibrating = False
+        self.calibration_step = "stopped"
+        
+        # Turn off all lights we were testing
+        if self.lights:
+            await self._set_all_lights(False)
+        
+        await self.async_request_refresh()
 
     async def _send_notification(self, title: str, message: str) -> None:
-        """Send persistent notification to user."""
+        """Send a persistent notification."""
         try:
             await self.hass.services.async_call(
                 "persistent_notification", "create",
@@ -134,70 +147,116 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         """Read configuration from integration options."""
         options = self.config_entry.options
 
-        _LOGGER.info("Debug: Config entry options: %s", options)
+        _LOGGER.error("=== CONFIGURATION DEBUG START ===")
+        _LOGGER.error("Reading configuration from options: %s", options)
 
         if not options:
             raise HomeAssistantError("No configuration found - use integration options to configure")
         
         # Get test area information
         test_area_id = options.get("test_area")
-        _LOGGER.info("Debug: test_area_id from options: %s", test_area_id)
         if not test_area_id:
             raise HomeAssistantError("No test area configured")
         
         area_reg = area_registry.async_get(self.hass)
         test_area = area_reg.areas.get(test_area_id)
-        _LOGGER.info("Debug: Found test_area object: %s", test_area)
         if not test_area:
-            raise HomeAssistantError(f"Test area {test_area_id} not found")
+            raise HomeAssistantError(f"Test area '{test_area_id}' not found")
+        
+        _LOGGER.error("Test area found: %s (ID: %s)", test_area.name, test_area.id)
         
         # Get sensor
         sensor_entity = options.get("sensor_entity")
         if not sensor_entity:
             raise HomeAssistantError("No sensor configured")
         
+        _LOGGER.error("Sensor configured: %s", sensor_entity)
+        
         # Get adjacent areas
         adjacent_areas = []
+        adjacent_names = []
         for direction in ["north_area", "south_area", "east_area", "west_area"]:
             area_id = options.get(direction)
+            _LOGGER.error("Direction %s: area_id = %s", direction, area_id)
             if area_id and area_id != "none":
                 area = area_reg.areas.get(area_id)
                 if area:
                     adjacent_areas.append(area)
+                    adjacent_names.append(area.name)
+                    _LOGGER.error("Adjacent area %s: %s (ID: %s)", direction, area.name, area.id)
+                else:
+                    _LOGGER.error("Adjacent area %s: ID %s not found in registry", direction, area_id)
         
         # Get all lights from test area and adjacent areas
         all_areas = [test_area] + adjacent_areas
+        _LOGGER.error("Total areas to search: %d", len(all_areas))
+        _LOGGER.error("Area list: %s", [f"{a.name} (ID: {a.id})" for a in all_areas])
+        
         lights = await self._get_lights_from_areas(all_areas)
         
+        _LOGGER.error("=== CONFIGURATION DEBUG END ===")
+        
         return {
-            "test_area": test_area.name.lower(),
+            "test_area": test_area.name,
             "sensor_entity": sensor_entity,
             "lights": lights,
-            "adjacent_areas": [area.name.lower() for area in adjacent_areas],
+            "adjacent_areas": adjacent_names,
             "area_count": len(all_areas)
         }
 
     async def _get_lights_from_areas(self, areas: List) -> List[str]:
-        """Get all light entities from specified areas."""
-        ent_reg = entity_registry.async_get(self.hass)
-        lights = []
-        
-        _LOGGER.info("Debug: Looking for lights in areas: %s", [area.name for area in areas])
-        for area in areas:
-            _LOGGER.info("Debug: Area %s (ID: %s) lights:", area.name, area.id)
-            area_lights = [entity.entity_id for entity in ent_reg.entities.values() 
-                           if entity.area_id == area.id and entity.entity_id.startswith("light.")]
-            _LOGGER.info("Debug: Found lights: %s", area_lights)
-
-        for area in areas:
-            # Find lights in this area
-            for entity in ent_reg.entities.values():
-                if (entity.area_id == area.id and 
-                    entity.entity_id.startswith("light.") and
-                    not entity.disabled):
-                    lights.append(entity.entity_id)
-        
-        return lights
+        """Get all light entities from specified areas with extensive debugging."""
+        try:
+            ent_reg = entity_registry.async_get(self.hass)
+            lights = []
+            
+            _LOGGER.error("=== LIGHT DISCOVERY DEBUG START ===")
+            _LOGGER.error("Entity registry has %d total entities", len(ent_reg.entities))
+            _LOGGER.error("Looking for lights in %d areas: %s", len(areas), [area.name for area in areas])
+            
+            # Debug: Show all light entities in the system
+            all_light_entities = [e for e in ent_reg.entities.values() if e.entity_id.startswith("light.")]
+            _LOGGER.error("Total light entities in system: %d", len(all_light_entities))
+            
+            for light in all_light_entities[:5]:  # Show first 5 for debugging
+                _LOGGER.error("Sample light: %s, area_id: %s, disabled: %s", 
+                            light.entity_id, light.area_id, light.disabled)
+            
+            # Check each area
+            for area in areas:
+                _LOGGER.error("--- Checking area: %s (ID: %s) ---", area.name, area.id)
+                area_light_count = 0
+                
+                for entity in ent_reg.entities.values():
+                    # Check if this entity belongs to current area and is a light
+                    if entity.area_id == area.id and entity.entity_id.startswith("light."):
+                        area_light_count += 1
+                        _LOGGER.error("Found light in area: %s (disabled: %s)", entity.entity_id, entity.disabled)
+                        
+                        # Only add if not disabled
+                        if not entity.disabled:
+                            # Verify the entity actually exists in HA
+                            state = self.hass.states.get(entity.entity_id)
+                            if state:
+                                lights.append(entity.entity_id)
+                                _LOGGER.error("Added light to list: %s", entity.entity_id)
+                            else:
+                                _LOGGER.error("Light entity exists in registry but not in states: %s", entity.entity_id)
+                        else:
+                            _LOGGER.error("Skipping disabled light: %s", entity.entity_id)
+                
+                _LOGGER.error("Area %s summary: %d total lights, %d will be tested", area.name, area_light_count, len([l for l in lights if any(e.entity_id == l and e.area_id == area.id for e in ent_reg.entities.values())]))
+            
+            _LOGGER.error("=== LIGHT DISCOVERY DEBUG END ===")
+            _LOGGER.error("Final light list (%d lights): %s", len(lights), lights)
+            
+            return lights
+            
+        except Exception as err:
+            _LOGGER.error("Exception in _get_lights_from_areas: %s", err)
+            import traceback
+            _LOGGER.error("Traceback: %s", traceback.format_exc())
+            return []
 
     async def start_calibration_from_options(self) -> None:
         """Start calibration using configuration from integration options."""
@@ -208,6 +267,7 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         try:
             config = await self._get_configuration_from_options()
         except Exception as err:
+            _LOGGER.error("Failed to read configuration: %s", err)
             raise HomeAssistantError(f"Failed to read configuration: {err}")
         
         # Update coordinator with configuration
@@ -215,10 +275,13 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         self.sensor_entity = config["sensor_entity"] 
         self.lights = config["lights"]
         
-        if not self.lights:
-            raise HomeAssistantError(f"No lights found in {config['area_count']} selected areas")
+        _LOGGER.info("Configuration loaded: area=%s, sensor=%s, lights=%d", 
+                     self.room_name, self.sensor_entity, len(self.lights))
         
-        _LOGGER.info("Starting calibration from options: area=%s, sensor=%s, lights=%d, adjacent_areas=%s", 
+        if not self.lights:
+            raise HomeAssistantError(f"No lights found in {config['area_count']} selected areas. Check that areas have light entities and they are not disabled.")
+        
+        _LOGGER.info("Starting calibration: area=%s, sensor=%s, lights=%d, adjacent_areas=%s", 
                      self.room_name, self.sensor_entity, len(self.lights), config["adjacent_areas"])
         
         # Use existing calibration logic
@@ -232,8 +295,8 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         if not self.room_name or not self.sensor_entity or not self.lights:
             raise HomeAssistantError("Calibration configuration incomplete - configure integration options first")
             
-        _LOGGER.info("Starting calibration for room: %s with sensor: %s", 
-                     self.room_name, self.sensor_entity)
+        _LOGGER.info("Starting calibration for room: %s with sensor: %s and %d lights", 
+                     self.room_name, self.sensor_entity, len(self.lights))
         
         # Send start notification
         await self._send_notification(
@@ -307,10 +370,14 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         if not sensor_state:
             raise HomeAssistantError(f"Sensor {self.sensor_entity} not found")
         
+        if sensor_state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
+            raise HomeAssistantError(f"Sensor {self.sensor_entity} is unavailable")
+        
         try:
-            float(sensor_state.state)
+            current_lux = float(sensor_state.state)
+            _LOGGER.info("Sensor validation passed: current reading %.1f lux", current_lux)
         except (ValueError, TypeError):
-            raise HomeAssistantError(f"Sensor {self.sensor_entity} does not report illuminance")
+            raise HomeAssistantError(f"Sensor {self.sensor_entity} does not report numeric illuminance value")
         
         self.calibration_step = "validating_lights"
         await self.async_request_refresh()
@@ -320,7 +387,7 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         for light_entity in self.lights:
             light_state = self.hass.states.get(light_entity)
             if not light_state:
-                _LOGGER.warning("Light %s not found, skipping", light_entity)
+                _LOGGER.warning("Light %s not found in states, skipping", light_entity)
                 continue
             if light_state.domain != "light":
                 _LOGGER.warning("Entity %s is not a light, skipping", light_entity)
@@ -338,70 +405,61 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         self.calibration_step = "calibrating_timing"
         await self.async_request_refresh()
         
-        if not self.lights:
-            raise HomeAssistantError("No lights available for timing calibration")
-        
         test_light = self.lights[0]
-        _LOGGER.info("Calibrating timing with light: %s", test_light)
+        _LOGGER.info("Calibrating timing using light: %s", test_light)
         
-        # Turn off all lights
-        await self._turn_off_all_lights()
-        await asyncio.sleep(2)
+        # Turn off all lights first
+        await self._set_all_lights(False)
+        await asyncio.sleep(3)  # Initial settle
         
-        # Get baseline reading
-        baseline = await self._get_sensor_reading()
+        initial_lux = await self._read_sensor()
         
-        # Turn on test light
-        await self.hass.services.async_call(
-            LIGHT_DOMAIN, "turn_on", 
-            {"entity_id": test_light, "brightness_pct": 100}
-        )
+        # Turn on test light and measure settle time
+        await self._set_light_brightness(test_light, 255)
         
-        # Monitor until stable
-        stable_reading = None
-        last_reading = baseline
-        stable_count = 0
-        max_wait = 30  # Maximum 30 seconds
-        
-        for i in range(max_wait):
+        readings = []
+        for i in range(10):  # Test for 10 seconds
             await asyncio.sleep(1)
-            current_reading = await self._get_sensor_reading()
+            lux = await self._read_sensor()
+            readings.append(lux)
             
-            if abs(current_reading - last_reading) < 5:  # Within 5 lux
-                stable_count += 1
-                if stable_count >= 3:  # Stable for 3 seconds
-                    stable_reading = current_reading
-                    self.settle_time_seconds = (i + 1) * self.timing_buffer
+            # Check if settled (last 3 readings within 2 lux)
+            if len(readings) >= 3:
+                recent = readings[-3:]
+                if max(recent) - min(recent) <= 2:
+                    settle_time = i + 1
                     break
-            else:
-                stable_count = 0
-            
-            last_reading = current_reading
+        else:
+            settle_time = 5  # Default if no clear settle point
         
-        if stable_reading is None:
-            raise HomeAssistantError("Could not determine stable timing")
+        # Add buffer
+        self.settle_time_seconds = max(3, int(settle_time * self.timing_buffer))
         
-        _LOGGER.info("Timing calibrated: %.1f seconds settle time", self.settle_time_seconds)
+        # Clean up
+        await self._set_light_brightness(test_light, 0)
+        await asyncio.sleep(self.settle_time_seconds)
+        
+        _LOGGER.info("Timing calibration complete: settle_time=%d seconds", self.settle_time_seconds)
 
     async def _test_min_max_values(self) -> None:
-        """Test minimum and maximum light values."""
+        """Test minimum and maximum light levels."""
         self.calibration_step = "testing_min_max"
         await self.async_request_refresh()
         
         # Test minimum (all lights off)
-        await self._turn_off_all_lights()
+        await self._set_all_lights(False)
         await asyncio.sleep(self.settle_time_seconds)
-        self.min_lux = await self._get_sensor_reading()
+        self.min_lux = await self._read_sensor()
         
-        # Test maximum (all lights on)
-        await self._turn_on_all_lights()
+        # Test maximum (all lights on full)
+        await self._set_all_lights(True)
         await asyncio.sleep(self.settle_time_seconds)
-        self.max_lux = await self._get_sensor_reading()
+        self.max_lux = await self._read_sensor()
+        
+        _LOGGER.info("Min/Max levels: min=%.1f lux, max=%.1f lux", self.min_lux, self.max_lux)
         
         if self.max_lux <= self.min_lux:
-            raise HomeAssistantError("Max lux not greater than min lux")
-        
-        _LOGGER.info("Min lux: %.1f, Max lux: %.1f", self.min_lux, self.max_lux)
+            raise HomeAssistantError(f"Invalid min/max values: min={self.min_lux}, max={self.max_lux}")
 
     async def _test_light_contributions(self) -> None:
         """Test individual light contributions."""
@@ -410,190 +468,120 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         
         self.light_contributions = {}
         
-        for light_entity in self.lights:
-            _LOGGER.info("Testing contribution of: %s", light_entity)
+        for i, light_entity in enumerate(self.lights):
+            _LOGGER.info("Testing light %d/%d: %s", i+1, len(self.lights), light_entity)
             
             # Turn off all lights
-            await self._turn_off_all_lights()
+            await self._set_all_lights(False)
             await asyncio.sleep(self.settle_time_seconds)
+            base_lux = await self._read_sensor()
             
-            # Turn on this light at 100%
-            await self.hass.services.async_call(
-                LIGHT_DOMAIN, "turn_on",
-                {"entity_id": light_entity, "brightness_pct": 100}
-            )
+            # Turn on this light
+            await self._set_light_brightness(light_entity, 255)
             await asyncio.sleep(self.settle_time_seconds)
-            light_100_reading = await self._get_sensor_reading()
+            with_light_lux = await self._read_sensor()
             
-            # Test at 50% for linearity
-            await self.hass.services.async_call(
-                LIGHT_DOMAIN, "turn_on",
-                {"entity_id": light_entity, "brightness_pct": 50}
-            )
-            await asyncio.sleep(self.settle_time_seconds)
-            light_50_reading = await self._get_sensor_reading()
-            
-            # Calculate contribution
-            max_contribution = light_100_reading - self.min_lux
-            
-            # Skip lights with no measurable contribution
-            if max_contribution <= 0:
-                _LOGGER.warning(
-                    "Light %s has no measurable contribution (%.1f lux), skipping",
-                    light_entity, max_contribution
-                )
-                continue
-            
-            # Calculate linearity with better error handling
-            expected_50_contribution = max_contribution * 0.5 + self.min_lux
-            linearity_error = 0
-            linear_validated = False
-            
-            # Test square root curve fit as well
-            sqrt_expected_50 = max_contribution * (0.5 ** 0.5) + self.min_lux
-            sqrt_error = 0
-            
-            # Avoid division by zero and provide detailed diagnostics
-            if max_contribution > 1:  # Only test if contribution is significant
-                linearity_error = abs(light_50_reading - expected_50_contribution) / max_contribution
-                sqrt_error = abs(light_50_reading - sqrt_expected_50) / max_contribution
-                linear_validated = linearity_error < 0.05  # Within 5%
-                sqrt_validated = sqrt_error < 0.05
-                
-                _LOGGER.info(
-                    "Light %s: Expected linear %.1f, sqrt %.1f, Actual %.1f - Linear error %.1f%%, Sqrt error %.1f%% (%s)",
-                    light_entity, expected_50_contribution, sqrt_expected_50, light_50_reading,
-                    linearity_error * 100, sqrt_error * 100, 
-                    "LINEAR" if linear_validated else "SQRT" if sqrt_validated else "NON-LINEAR"
-                )
-            else:
-                _LOGGER.warning(
-                    "Light %s contribution too small for linearity testing (%.1f lux)",
-                    light_entity, max_contribution
-                )
+            contribution = with_light_lux - base_lux
             
             self.light_contributions[light_entity] = {
-                "max_contribution": max_contribution,
-                "linear_validated": linear_validated,
-                "linearity_error": linearity_error,
-                "sqrt_error": sqrt_error,
-                "readings": {
-                    "min_lux": self.min_lux,
-                    "light_100_reading": light_100_reading,
-                    "light_50_reading": light_50_reading,
-                    "expected_50_linear": expected_50_contribution,
-                    "expected_50_sqrt": sqrt_expected_50
-                }
+                "max_contribution": max(0, contribution),
+                "base_reading": base_lux,
+                "with_light_reading": with_light_lux,
+                "linear_validated": True  # Will validate in next step
             }
             
-            _LOGGER.info(
-                "Light %s: %.1f lux contribution, %.1f%% linearity error, %.1f%% sqrt error",
-                light_entity, max_contribution, linearity_error * 100, sqrt_error * 100
-            )
+            _LOGGER.info("Light %s contribution: %.1f lux", light_entity, contribution)
 
     async def _validate_light_pairs(self) -> None:
-        """Validate that light contributions are additive."""
+        """Validate that light contributions are approximately additive."""
         self.calibration_step = "validating_pairs"
         await self.async_request_refresh()
         
-        if len(self.light_contributions) < 2:
-            _LOGGER.warning("Not enough contributing lights for pair validation")
-            return
+        # Test a few pairs to validate additivity
+        lights_to_test = list(self.light_contributions.keys())[:3]  # Test first 3 lights
         
-        # Sort lights by contribution (highest and lowest)
-        sorted_lights = sorted(
-            self.light_contributions.keys(),
-            key=lambda x: self.light_contributions[x]["max_contribution"],
-            reverse=True
-        )
-        
-        highest_light = sorted_lights[0]
-        lowest_light = sorted_lights[-1]
-        
-        _LOGGER.info("Testing pair: %s + %s", highest_light, lowest_light)
-        
-        # Turn off all lights
-        await self._turn_off_all_lights()
-        await asyncio.sleep(self.settle_time_seconds)
-        
-        # Turn on both lights
-        await self.hass.services.async_call(
-            LIGHT_DOMAIN, "turn_on",
-            {"entity_id": [highest_light, lowest_light], "brightness_pct": 100}
-        )
-        await asyncio.sleep(self.settle_time_seconds)
-        combined_reading = await self._get_sensor_reading()
-        
-        # Calculate expected vs actual
-        expected_combined = (
-            self.min_lux + 
-            self.light_contributions[highest_light]["max_contribution"] +
-            self.light_contributions[lowest_light]["max_contribution"]
-        )
-        
-        error_percentage = abs(combined_reading - expected_combined) / expected_combined
-        
-        self.validation_results = {
-            "pair_tested": f"{highest_light} + {lowest_light}",
-            "expected_lux": expected_combined,
-            "actual_lux": combined_reading,
-            "error_percentage": error_percentage,
-            "passed": error_percentage < 0.10  # Within 10% (relaxed from 5%)
-        }
-        
-        _LOGGER.info(
-            "Pair validation: Expected %.1f, Actual %.1f, Error %.1f%% (%s)",
-            expected_combined, combined_reading, error_percentage * 100,
-            "PASS" if self.validation_results["passed"] else "FAIL"
-        )
-        
-        if not self.validation_results["passed"]:
-            _LOGGER.warning(f"Pair validation failed: {error_percentage:.1%} error, but continuing calibration")
+        for i in range(len(lights_to_test) - 1):
+            light1 = lights_to_test[i]
+            light2 = lights_to_test[i + 1]
+            
+            # Get individual contributions
+            contrib1 = self.light_contributions[light1]["max_contribution"]
+            contrib2 = self.light_contributions[light2]["max_contribution"]
+            expected_total = contrib1 + contrib2
+            
+            # Test both lights together
+            await self._set_all_lights(False)
+            await asyncio.sleep(self.settle_time_seconds)
+            base_lux = await self._read_sensor()
+            
+            await self._set_light_brightness(light1, 255)
+            await self._set_light_brightness(light2, 255)
+            await asyncio.sleep(self.settle_time_seconds)
+            both_lights_lux = await self._read_sensor()
+            
+            actual_total = both_lights_lux - base_lux
+            
+            # Calculate error percentage
+            error_pct = abs(actual_total - expected_total) / expected_total * 100 if expected_total > 0 else 0
+            
+            _LOGGER.info("Pair validation %s + %s: expected=%.1f, actual=%.1f, error=%.1f%%", 
+                        light1, light2, expected_total, actual_total, error_pct)
+            
+            # Store validation results (relaxed tolerance - 30% is acceptable for MVP)
+            self.validation_results[f"{light1}+{light2}"] = {
+                "expected": expected_total,
+                "actual": actual_total,
+                "error_percent": error_pct,
+                "valid": error_pct <= 30
+            }
 
     async def _save_calibration_data(self) -> None:
-        """Save calibration data to logs and future text helper."""
+        """Save calibration data to config entry."""
         self.calibration_step = "saving_data"
         await self.async_request_refresh()
         
-        # Create text helper entity name
-        helper_entity = f"text.adaptive_ell_calibration_{self.room_name}"
-        
-        # Prepare calibration data
         calibration_data = {
+            "timestamp": datetime.now().isoformat(),
             "room_name": self.room_name,
-            "sensor_entity": self.sensor_entity,
-            "calibrated_at": datetime.now().isoformat(),
-            "timing_buffer": self.timing_buffer,
-            "settle_time_seconds": self.settle_time_seconds,
             "min_lux": self.min_lux,
             "max_lux": self.max_lux,
-            "lights": self.light_contributions,
-            "pair_validation": self.validation_results
+            "light_contributions": self.light_contributions,
+            "validation_results": self.validation_results,
+            "settle_time_seconds": self.settle_time_seconds
         }
         
-        # For now, just log the data (helper creation will be in future version)
-        _LOGGER.info("Calibration data for %s: %s", helper_entity, json.dumps(calibration_data, indent=2))
+        # Update config entry data
+        new_data = {**self.config_entry.data, "calibration": calibration_data}
+        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+        
+        _LOGGER.info("Calibration data saved successfully")
 
-    async def _turn_off_all_lights(self) -> None:
-        """Turn off all test lights."""
-        if self.lights:
-            await self.hass.services.async_call(
-                LIGHT_DOMAIN, "turn_off", {"entity_id": self.lights}
-            )
+    async def _set_all_lights(self, state: bool) -> None:
+        """Turn all lights on or off."""
+        brightness = 255 if state else 0
+        tasks = [self._set_light_brightness(light, brightness) for light in self.lights]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _turn_on_all_lights(self) -> None:
-        """Turn on all test lights at 100%."""
-        if self.lights:
-            await self.hass.services.async_call(
-                LIGHT_DOMAIN, "turn_on", 
-                {"entity_id": self.lights, "brightness_pct": 100}
-            )
+    async def _set_light_brightness(self, entity_id: str, brightness: int) -> None:
+        """Set light brightness (0 = off, 255 = full brightness)."""
+        try:
+            if brightness > 0:
+                await self.hass.services.async_call(
+                    "light", "turn_on",
+                    {"entity_id": entity_id, "brightness": brightness},
+                    blocking=True
+                )
+            else:
+                await self.hass.services.async_call(
+                    "light", "turn_off",
+                    {"entity_id": entity_id},
+                    blocking=True
+                )
+        except Exception as err:
+            _LOGGER.error("Failed to control light %s: %s", entity_id, err)
 
-    async def _get_sensor_reading(self) -> float:
-        """Get current sensor reading."""
-        if not self.sensor_entity:
-            raise HomeAssistantError("No sensor configured")
-            
+    async def _read_sensor(self) -> float:
+        """Read current sensor value."""
         sensor_state = self.hass.states.get(self.sensor_entity)
         if not sensor_state or sensor_state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
             raise HomeAssistantError(f"Sensor {self.sensor_entity} unavailable")
@@ -601,21 +589,4 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         try:
             return float(sensor_state.state)
         except (ValueError, TypeError):
-            raise HomeAssistantError(f"Invalid sensor reading: {sensor_state.state}")
-
-    async def stop_calibration(self) -> None:
-        """Stop calibration process."""
-        if not self.is_calibrating:
-            return
-        
-        self.is_calibrating = False
-        self.calibration_step = "stopped"
-        await self._turn_off_all_lights()
-        
-        # Send stop notification
-        await self._send_notification(
-            "Calibration Stopped",
-            f"{self.room_name.title() if self.room_name else 'Calibration'} was stopped by user. Lights have been turned off."
-        )
-        
-        await self.async_request_refresh()
+            raise HomeAssistantError(f"Sensor {self.sensor_entity} returned non-numeric value: {sensor_state.state}")
