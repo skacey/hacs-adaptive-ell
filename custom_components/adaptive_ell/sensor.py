@@ -1,6 +1,7 @@
 """Adaptive ELL sensor platform."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -17,6 +18,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import AdaptiveELLCoordinator
 
+_LOGGER = logging.getLogger(__name__)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -24,7 +27,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Adaptive ELL sensor platform."""
-    coordinator = hass.data[DOMAIN]
+    # Get the coordinator for this specific config entry
+    coordinator = hass.data[DOMAIN][entry.entry_id]
     
     sensors = [
         AdaptiveELLSensor(coordinator),
@@ -43,19 +47,27 @@ class AdaptiveELLSensor(CoordinatorEntity, SensorEntity):
         
         # Safe naming with None handling
         room_name = coordinator.room_name or "Unconfigured"
+        area_slug = room_name.lower().replace(" ", "_")
+        
         self._attr_name = f"Adaptive ELL {room_name.title()}"
-        self._attr_unique_id = f"adaptive_ell_{room_name.lower().replace(' ', '_')}"
+        self._attr_unique_id = f"adaptive_ell_{area_slug}"
         self._attr_device_class = SensorDeviceClass.ILLUMINANCE
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_native_unit_of_measurement = LIGHT_LUX
         self._attr_icon = "mdi:lightbulb-on"
+        
+        _LOGGER.info("Created ELL sensor: %s (ID: %s)", self._attr_name, self._attr_unique_id)
 
     @property
     def native_value(self) -> float | None:
         """Return the estimated light level."""
         if not self.coordinator.data:
+            _LOGGER.debug("No coordinator data for %s", self._attr_name)
             return None
-        return self.coordinator.data.get("estimated_lux")
+            
+        estimated = self.coordinator.data.get("estimated_lux")
+        _LOGGER.debug("ELL sensor %s returning: %s", self._attr_name, estimated)
+        return estimated
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -110,7 +122,7 @@ class AdaptiveELLCalibrationSensor(CoordinatorEntity, SensorEntity):
         
         # Check if integration is configured
         if not self.coordinator.sensor_entity:
-            return "⚙️ Not Configured - Use Integration Options"
+            return "⚙️ Not Configured - Use Integration Configure"
         
         if self.coordinator.data.get("calibrating"):
             step = self.coordinator.data.get("calibration_step", "calibrating")
@@ -125,7 +137,7 @@ class AdaptiveELLCalibrationSensor(CoordinatorEntity, SensorEntity):
                 "validating_pairs": "✅ Validating Results...",
                 "saving_data": "💾 Saving Calibration Data...",
                 "completed": "✅ Calibration Complete!",
-                "stopped": "⏹️ Calibration Stopped"
+                "stopped": "ℹ️ Calibration Stopped"
             }
             friendly_name = step_names.get(step, f"🔄 {step}...")
             
@@ -159,7 +171,7 @@ class AdaptiveELLCalibrationSensor(CoordinatorEntity, SensorEntity):
             "settle_time_seconds": self.coordinator.settle_time_seconds,
             "timing_buffer": self.coordinator.timing_buffer,
             "lights_to_test": self.coordinator.lights,
-            "configuration_source": "integration_options" if is_configured else "none"
+            "configuration_source": "config_flow" if is_configured else "none"
         }
         
         # Add progress percentage if calibrating

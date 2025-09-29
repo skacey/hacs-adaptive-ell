@@ -29,108 +29,133 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=300),  # 5 minutes
+            update_interval=timedelta(seconds=10),  # More responsive updates for real-time feel
         )
         
         # Store config entry reference
         self.config_entry = config_entry
         
-        # Configuration from options - all start empty/None
-        self.room_name = None
-        self.sensor_entity = None
+        # Read basic configuration immediately for sensor naming
+        config_data = config_entry.options or config_entry.data
+        test_area_id = config_data.get("test_area")
+        
+        if test_area_id:
+            area_reg = area_registry.async_get(hass)
+            area = area_reg.areas.get(test_area_id)
+            self.room_name = area.name if area else "Unknown"
+        else:
+            self.room_name = "Unconfigured"
+        
+        # Configuration - will be fully loaded during calibration
+        self.sensor_entity = config_data.get("sensor_entity")
         self.lights = []
         
-        # Calibration state
-        self.is_calibrating = False
-        self.calibration_step = "idle"
-        self.settle_time_seconds = 0
-        self.timing_buffer = 1.25
-        self.initial_light_states = {}  # Store original light states
+        # Load existing calibration data if available
+        existing_calibration = config_data.get("calibration", {})
         
-        # Calibration results
+        # Initialize calibration results with defaults first
         self.min_lux = 0
         self.max_lux = 0
         self.light_contributions = {}
         self.validation_results = {}
+        self.settle_time_seconds = 0
+        
+        # Then override with existing data if available
+        if existing_calibration:
+            self.min_lux = existing_calibration.get("min_lux", 0)
+            self.max_lux = existing_calibration.get("max_lux", 0)
+            self.light_contributions = existing_calibration.get("light_contributions", {})
+            self.validation_results = existing_calibration.get("validation_results", {})
+            self.settle_time_seconds = existing_calibration.get("settle_time_seconds", 0)
+            _LOGGER.info("Loaded existing calibration data for %s: %d contributing lights", 
+                        self.room_name, len(self.light_contributions))
+        
+        # Calibration state
+        self.is_calibrating = False
+        self.calibration_step = "idle"
+        self.timing_buffer = 1.25
+        self.initial_light_states = {}  # Store original light states
+        
+        # State change listeners
+        self._unsub_state_listeners = []
+        self._light_state_dirty = False  # Flag to indicate lights changed
         
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data from Home Assistant."""
         try:
-            data = {}
+            # Return current state
+            data = {
+                "calibrating": self.is_calibrating,
+                "calibration_step": self.calibration_step,
+                "min_lux": self.min_lux,
+                "max_lux": self.max_lux,
+                "lights_count": len(self.lights)
+            }
             
-            # Basic state information
-            data["calibrating"] = self.is_calibrating
-            data["calibration_step"] = self.calibration_step
-            
-            # Get current sensor reading if configured
+            # Add current sensor reading if available
             if self.sensor_entity:
                 sensor_state = self.hass.states.get(self.sensor_entity)
                 if sensor_state and sensor_state.state not in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
                     try:
                         current_lux = float(sensor_state.state)
                         data["current_lux"] = current_lux
+                        
+                        # Calculate estimated light level if calibrated
+                        if self.light_contributions:
+                            estimated_lux = await self._calculate_current_estimated_lux()
+                            data["estimated_lux"] = estimated_lux
+                            
+                            # Log when we detect light state changes
+                            if self._light_state_dirty:
+                                _LOGGER.debug("Light state changed, updated estimated lux: %.1f", estimated_lux)
+                                self._light_state_dirty = False
+                                
                     except (ValueError, TypeError):
-                        data["current_lux"] = 0
-                else:
-                    data["current_lux"] = 0
-            else:
-                data["current_lux"] = 0
+                        pass
             
-            # Add calibration results
-            data["min_lux"] = self.min_lux
-            data["max_lux"] = self.max_lux
+            # If we have calibration data but no state listeners set up, set them up
+            if self.light_contributions and not self._unsub_state_listeners:
+                await self._setup_light_state_listeners()
             
-            # Calculate estimated lux if we have calibration data
-            if self.light_contributions and not self.is_calibrating:
-                estimated_lux = await self._calculate_estimated_lux()
-                data["estimated_lux"] = estimated_lux
-            else:
-                data["estimated_lux"] = 0
-                
             return data
             
         except Exception as err:
-            _LOGGER.error("Error updating data: %s", err)
             raise UpdateFailed(f"Error updating data: {err}")
 
-    async def _calculate_estimated_lux(self) -> float:
-        """Calculate estimated lux based on current light states."""
-        if not self.light_contributions:
-            return 0
+    async def async_shutdown(self) -> None:
+        """Cleanup when coordinator is shutting down."""
+        await self._cleanup_state_listeners()
+        await super().async_shutdown()
+
+    async def _calculate_current_estimated_lux(self) -> float:
+        """Calculate current estimated lux based on light states."""
+        total_estimated = 0
         
-        total_lux = self.min_lux  # Start with ambient/min level
+        _LOGGER.debug("Calculating estimated lux with %d contributing lights", len(self.light_contributions))
         
-        for light_entity, contribution_data in self.light_contributions.items():
+        for light_entity, contrib_data in self.light_contributions.items():
             light_state = self.hass.states.get(light_entity)
             if not light_state or light_state.state != STATE_ON:
+                _LOGGER.debug("Light %s is off, skipping", light_entity)
                 continue
                 
+            # Get current brightness (0-255)
             brightness = light_state.attributes.get("brightness", 255)
-            brightness_pct = brightness / 255.0
-            max_contribution = contribution_data.get("max_contribution", 0)
+            brightness_percent = brightness / 255.0
             
-            # Simple linear model for now
-            light_contribution = max_contribution * brightness_pct
-            total_lux += light_contribution
-        
-        return round(total_lux, 1)
-
-    async def stop_calibration(self) -> None:
-        """Stop any running calibration."""
-        if not self.is_calibrating:
-            return
+            # Calculate contribution based on brightness
+            max_contribution = contrib_data.get("max_contribution", 0)
+            current_contribution = max_contribution * brightness_percent
+            total_estimated += current_contribution
             
-        _LOGGER.info("Stopping calibration")
-        self.is_calibrating = False
-        self.calibration_step = "stopped"
+            _LOGGER.debug("Light %s: brightness=%d (%.1f%%), contrib=%.1f lux", 
+                         light_entity, brightness, brightness_percent * 100, current_contribution)
         
-        # Restore lights to original state before stopping
-        await self._restore_initial_light_states()
-        
-        await self.async_request_refresh()
+        _LOGGER.debug("Total estimated lux: %.1f", total_estimated)
+        return round(total_estimated, 1)
 
     async def _send_notification(self, title: str, message: str) -> None:
-        """Send a persistent notification."""
+        """Send persistent notification."""
         try:
             await self.hass.services.async_call(
                 "persistent_notification", "create",
@@ -144,16 +169,17 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Failed to send notification: %s", err)
 
     async def _get_configuration_from_options(self) -> Dict[str, Any]:
-        """Read configuration from integration options."""
-        options = self.config_entry.options
+        """Read configuration from config entry data."""
+        # Try options first (for backwards compatibility), then data
+        config_data = self.config_entry.options or self.config_entry.data
 
-        _LOGGER.info("Reading configuration from options")
+        _LOGGER.info("Reading configuration from config entry")
 
-        if not options:
-            raise HomeAssistantError("No configuration found - use integration options to configure")
+        if not config_data:
+            raise HomeAssistantError("No configuration found - integration not properly configured")
         
         # Get test area information
-        test_area_id = options.get("test_area")
+        test_area_id = config_data.get("test_area")
         if not test_area_id:
             raise HomeAssistantError("No test area configured")
         
@@ -165,36 +191,62 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Test area: %s", test_area.name)
         
         # Get sensor
-        sensor_entity = options.get("sensor_entity")
+        sensor_entity = config_data.get("sensor_entity")
         if not sensor_entity:
             raise HomeAssistantError("No sensor configured")
         
         _LOGGER.info("Sensor: %s", sensor_entity)
         
-        # Get adjacent areas
-        adjacent_areas = []
-        adjacent_names = []
-        for direction in ["north_area", "south_area", "east_area", "west_area"]:
-            area_id = options.get(direction)
-            if area_id and area_id != "none":
-                area = area_reg.areas.get(area_id)
-                if area:
-                    adjacent_areas.append(area)
-                    adjacent_names.append(area.name)
+        # Get calibration scope and areas
+        calibration_scope = config_data.get("calibration_scope", "selected")  # "brute_force" or "selected"
         
-        # Get all lights from test area and adjacent areas
-        all_areas = [test_area] + adjacent_areas
-        _LOGGER.info("Searching %d areas: %s", len(all_areas), [a.name for a in all_areas])
+        if calibration_scope == "brute_force":
+            # Get all areas in the system
+            all_areas = list(area_reg.areas.values())
+            additional_areas = [area for area in all_areas if area.id != test_area_id]
+            _LOGGER.info("Brute force mode: testing ALL %d areas", len(all_areas))
+        else:
+            # Get selected additional areas
+            additional_areas = []
+            selected_area_ids = config_data.get("selected_areas", [])
+            
+            for area_id in selected_area_ids:
+                if area_id != test_area_id:  # Don't duplicate test area
+                    area = area_reg.areas.get(area_id)
+                    if area:
+                        additional_areas.append(area)
+            
+            _LOGGER.info("Selected mode: testing %d additional areas", len(additional_areas))
         
+        # Get all lights from test area and additional areas
+        all_areas = [test_area] + additional_areas
         lights = await self._get_lights_from_areas(all_areas)
+        
+        # Calculate estimated time based on light count
+        estimated_minutes = self._estimate_calibration_time(len(lights))
         
         return {
             "test_area": test_area.name,
             "sensor_entity": sensor_entity,
             "lights": lights,
-            "adjacent_areas": adjacent_names,
-            "area_count": len(all_areas)
+            "calibration_scope": calibration_scope,
+            "area_count": len(all_areas),
+            "additional_area_names": [area.name for area in additional_areas],
+            "estimated_minutes": estimated_minutes
         }
+
+    def _estimate_calibration_time(self, light_count: int) -> int:
+        """Estimate calibration time based on light count."""
+        # Base time for setup and validation: 2 minutes
+        # Per light testing: ~30 seconds (timing + contribution + validation)
+        # Additional overhead: 20% buffer
+        
+        base_time = 2  # minutes
+        per_light_time = 0.5  # minutes (30 seconds)
+        buffer_multiplier = 1.2
+        
+        estimated = (base_time + (light_count * per_light_time)) * buffer_multiplier
+        return max(3, round(estimated))  # Minimum 3 minutes
 
     async def _get_lights_from_areas(self, areas: List) -> List[str]:
         """Get all light entities from specified areas."""
@@ -239,7 +291,7 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             return []
 
     async def start_calibration_from_options(self) -> None:
-        """Start calibration using configuration from integration options."""
+        """Start calibration using configuration from config entry data."""
         if self.is_calibrating:
             raise HomeAssistantError("Calibration already in progress")
         
@@ -256,11 +308,22 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         self.lights = config["lights"]
         
         _LOGGER.error("=== CALIBRATION STARTING ===")
-        _LOGGER.error("Room: %s | Sensor: %s | Found %d lights in %d areas", 
-                     self.room_name, self.sensor_entity, len(self.lights), config["area_count"])
+        _LOGGER.error("Room: %s | Sensor: %s | Found %d lights in %d areas (%s mode)", 
+                     self.room_name, self.sensor_entity, len(self.lights), 
+                     config["area_count"], config["calibration_scope"])
+        _LOGGER.error("Estimated time: %d minutes", config["estimated_minutes"])
         
         if not self.lights:
-            raise HomeAssistantError(f"No lights found in {config['area_count']} selected areas. Check that areas have light entities and they are not disabled.")
+            raise HomeAssistantError(f"No lights found in {config['area_count']} selected areas. "
+                                   f"Check that areas have light entities and they are not disabled.")
+        
+        # Send warning for large light counts
+        if len(self.lights) > 50:
+            await self._send_notification(
+                "Large Calibration Detected",
+                f"Calibrating {len(self.lights)} lights will take approximately {config['estimated_minutes']} minutes. "
+                f"Consider using Selected Areas mode for faster calibration."
+            )
         
         # Use existing calibration logic
         await self.start_calibration()
@@ -271,7 +334,7 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError("Calibration already in progress")
         
         if not self.room_name or not self.sensor_entity or not self.lights:
-            raise HomeAssistantError("Calibration configuration incomplete - configure integration options first")
+            raise HomeAssistantError("Calibration configuration incomplete - configure integration first")
             
         _LOGGER.info("Starting calibration for room: %s with sensor: %s and %d lights", 
                      self.room_name, self.sensor_entity, len(self.lights))
@@ -280,7 +343,8 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         await self._send_notification(
             "Adaptive ELL Calibration Started",
             f"Calibrating {self.room_name.title()} with {len(self.lights)} lights. "
-            f"This will take 10-15 minutes. Lights will turn on/off automatically."
+            f"This will take approximately {self._estimate_calibration_time(len(self.lights))} minutes. "
+            f"Lights will turn on/off automatically."
         )
         
         self.is_calibrating = True
@@ -311,6 +375,9 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             self.calibration_step = "completed"
             _LOGGER.error("=== CALIBRATION COMPLETED ===")
             
+            # Force data refresh to update sensors with calibration results
+            await self.async_request_refresh()
+            
             # Send completion notification
             contributing_lights = len(self.light_contributions)
             total_lights_tested = len(self.lights)
@@ -322,37 +389,132 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             _LOGGER.error("✓ SUCCESS: %d useful lights found (of %d tested) | Total: %.0f lux | Range: %.0f-%.0f lux",
                          contributing_lights, total_lights_tested, total_contribution, self.min_lux, self.max_lux)
             
+            # Check if estimated lux is now available
+            if self.light_contributions:
+                try:
+                    current_estimated = await self._calculate_current_estimated_lux()
+                    _LOGGER.error("✓ Current estimated light level: %.1f lux", current_estimated)
+                except Exception as est_err:
+                    _LOGGER.error("Failed to calculate current estimated lux: %s", est_err)
+            
             await self._send_notification(
                 "Calibration Complete!",
                 f"{self.room_name.title()} calibration finished successfully. "
-                f"Found {contributing_lights} useful lights out of {total_lights_tested} tested "
-                f"with {total_contribution:.0f} lux total contribution. "
-                f"Range: {self.min_lux:.0f}-{self.max_lux:.0f} lux."
+                f"Found {contributing_lights} useful lights (of {total_lights_tested} tested). "
+                f"Total contribution: {total_contribution:.0f} lux."
             )
             
         except Exception as err:
-            _LOGGER.error("Calibration failed: %s", err)
             self.calibration_step = f"failed: {err}"
+            _LOGGER.error("Calibration failed: %s", err)
             
-            # Send failure notification
             await self._send_notification(
                 "Calibration Failed",
-                f"{self.room_name.title()} calibration failed at step '{self.calibration_step}'. "
-                f"Error: {str(err)[:100]}... Check logs for details."
+                f"Calibration of {self.room_name.title()} failed: {err}"
             )
             
+            # Try to restore original light states
+            try:
+                await self._restore_initial_light_states()
+            except Exception as restore_err:
+                _LOGGER.error("Failed to restore light states: %s", restore_err)
+            
+            raise
         finally:
-            # Always restore lights to original state
-            await self._restore_initial_light_states()
             self.is_calibrating = False
+            # Trigger data update
             await self.async_request_refresh()
+
+    async def stop_calibration(self) -> None:
+        """Stop the calibration process."""
+        if not self.is_calibrating:
+            raise HomeAssistantError("No calibration in progress")
+        
+        _LOGGER.info("Stopping calibration")
+        self.is_calibrating = False
+        self.calibration_step = "stopped"
+        
+        # Try to restore original light states
+        try:
+            await self._restore_initial_light_states()
+        except Exception as err:
+            _LOGGER.error("Failed to restore light states: %s", err)
+        
+        await self._send_notification(
+            "Calibration Stopped",
+            f"Calibration of {self.room_name.title()} was stopped by user."
+        )
+        
+        # Trigger data update
+        await self.async_request_refresh()
+
+    # Real calibration methods
+    async def _capture_initial_light_states(self) -> None:
+        """Capture the current state of all lights before calibration."""
+        self.initial_light_states = {}
+        
+        _LOGGER.error("📸 Capturing initial light states...")
+        
+        for light_entity in self.lights:
+            light_state = self.hass.states.get(light_entity)
+            if light_state:
+                self.initial_light_states[light_entity] = {
+                    "state": light_state.state,
+                    "brightness": light_state.attributes.get("brightness"),
+                    "rgb_color": light_state.attributes.get("rgb_color"),
+                    "color_temp": light_state.attributes.get("color_temp"),
+                    "color_temp_kelvin": light_state.attributes.get("color_temp_kelvin"),
+                    "hs_color": light_state.attributes.get("hs_color"),
+                    "xy_color": light_state.attributes.get("xy_color"),
+                }
+                _LOGGER.info("Captured state for %s: %s", light_entity, light_state.state)
+
+    async def _restore_initial_light_states(self) -> None:
+        """Restore all lights to their original state before calibration."""
+        _LOGGER.error("🔄 Restoring initial light states...")
+        
+        for light_entity, saved_state in self.initial_light_states.items():
+            try:
+                if saved_state["state"] == STATE_OFF:
+                    await self.hass.services.async_call(
+                        LIGHT_DOMAIN, "turn_off", {"entity_id": light_entity}
+                    )
+                else:
+                    service_data = {"entity_id": light_entity}
+                    
+                    # Restore brightness
+                    if saved_state.get("brightness"):
+                        service_data["brightness"] = saved_state["brightness"]
+                    
+                    # Restore color (prioritize rgb, then color_temp, then other formats)
+                    if saved_state.get("rgb_color"):
+                        service_data["rgb_color"] = saved_state["rgb_color"]
+                    elif saved_state.get("color_temp"):
+                        service_data["color_temp"] = saved_state["color_temp"]
+                    elif saved_state.get("color_temp_kelvin"):
+                        service_data["color_temp_kelvin"] = saved_state["color_temp_kelvin"]
+                    elif saved_state.get("hs_color"):
+                        service_data["hs_color"] = saved_state["hs_color"]
+                    elif saved_state.get("xy_color"):
+                        service_data["xy_color"] = saved_state["xy_color"]
+                    
+                    await self.hass.services.async_call(
+                        LIGHT_DOMAIN, "turn_on", service_data
+                    )
+                    
+                _LOGGER.info("Restored %s to %s", light_entity, saved_state["state"])
+                
+            except Exception as err:
+                _LOGGER.error("Failed to restore %s: %s", light_entity, err)
+        
+        _LOGGER.info("Light state restoration complete")
 
     async def _validate_setup(self) -> None:
         """Validate sensor and lights are available."""
         self.calibration_step = "validating_sensor"
         await self.async_request_refresh()
         
-        # Check sensor
+        # Test sensor
         sensor_state = self.hass.states.get(self.sensor_entity)
         if not sensor_state:
             raise HomeAssistantError(f"Sensor {self.sensor_entity} not found")
@@ -362,103 +524,67 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         
         try:
             current_lux = float(sensor_state.state)
-            _LOGGER.error("✓ Sensor validation passed: %s reading %.1f lux", self.sensor_entity, current_lux)
+            _LOGGER.info("Sensor validated: %.1f lux", current_lux)
         except (ValueError, TypeError):
-            raise HomeAssistantError(f"Sensor {self.sensor_entity} does not report numeric illuminance value")
+            raise HomeAssistantError(f"Sensor {self.sensor_entity} has invalid value: {sensor_state.state}")
         
+        # Test lights
         self.calibration_step = "validating_lights"
         await self.async_request_refresh()
         
-        # Test which lights are actually controllable
-        valid_lights = []
-        excluded_lights = []
-        
-        _LOGGER.error("Testing controllability of %d lights...", len(self.lights))
+        working_lights = []
+        failed_lights = []
         
         for light_entity in self.lights:
             light_state = self.hass.states.get(light_entity)
             if not light_state:
-                excluded_lights.append(f"{light_entity} (not found)")
-                continue
-            if light_state.domain != "light":
-                excluded_lights.append(f"{light_entity} (not a light)")
+                failed_lights.append(f"{light_entity} (not found)")
                 continue
                 
-            # Test if light is controllable
-            if await self._is_light_controllable(light_entity):
-                valid_lights.append(light_entity)
-            else:
-                excluded_lights.append(f"{light_entity} (not controllable)")
+            if light_state.state == STATE_UNAVAILABLE:
+                failed_lights.append(f"{light_entity} (unavailable)")
+                continue
+                
+            working_lights.append(light_entity)
         
-        if excluded_lights:
-            _LOGGER.error("✗ Excluded %d lights: %s", len(excluded_lights), excluded_lights)
+        if not working_lights:
+            raise HomeAssistantError(f"No working lights found. Failed: {failed_lights}")
         
-        if not valid_lights:
-            raise HomeAssistantError("No controllable lights found for testing")
+        if failed_lights:
+            _LOGGER.warning("Some lights failed validation: %s", failed_lights)
         
-        self.lights = valid_lights
-        _LOGGER.error("✓ Found %d controllable lights for calibration", len(self.lights))
+        # Update lights list to only working lights
+        self.lights = working_lights
+        _LOGGER.info("Validated %d working lights", len(self.lights))
 
-    async def _is_light_controllable(self, entity_id: str) -> bool:
-        """Test if a light can be controlled (turned on/off)."""
+    async def _read_sensor(self) -> float:
+        """Read current lux value from sensor."""
+        sensor_state = self.hass.states.get(self.sensor_entity)
+        if not sensor_state or sensor_state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
+            raise HomeAssistantError(f"Sensor {self.sensor_entity} unavailable during reading")
+        
         try:
-            # Get initial state
-            initial_state = self.hass.states.get(entity_id)
-            if not initial_state:
-                return False
-            
-            was_on = initial_state.state == STATE_ON
-            
-            # Try to turn it off if it's on, or on if it's off
-            if was_on:
-                await self.hass.services.async_call(
-                    "light", "turn_off",
-                    {"entity_id": entity_id},
-                    blocking=True
-                )
-                await asyncio.sleep(1)
-                
-                # Check if it actually turned off
-                new_state = self.hass.states.get(entity_id)
-                turned_off = new_state and new_state.state == STATE_OFF
-                
-                # Restore original state
-                if turned_off:
-                    await self.hass.services.async_call(
-                        "light", "turn_on",
-                        {"entity_id": entity_id},
-                        blocking=True
-                    )
-                
-                return turned_off
-            else:
-                await self.hass.services.async_call(
-                    "light", "turn_on",
-                    {"entity_id": entity_id, "brightness": 128},
-                    blocking=True
-                )
-                await asyncio.sleep(1)
-                
-                # Check if it actually turned on
-                new_state = self.hass.states.get(entity_id)
-                turned_on = new_state and new_state.state == STATE_ON
-                
-                # Turn it back off
-                if turned_on:
-                    await self.hass.services.async_call(
-                        "light", "turn_off",
-                        {"entity_id": entity_id},
-                        blocking=True
-                    )
-                
-                return turned_on
-                
-        except Exception as err:
-            _LOGGER.warning("Error testing light %s controllability: %s", entity_id, err)
-            return False
+            return float(sensor_state.state)
+        except (ValueError, TypeError):
+            raise HomeAssistantError(f"Invalid sensor reading: {sensor_state.state}")
+
+    async def _set_light_to_white(self, entity_id: str, brightness: int) -> None:
+        """Set a light to white at specified brightness."""
+        if brightness == 0:
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN, "turn_off", {"entity_id": entity_id}
+            )
+        else:
+            await self.hass.services.async_call(
+                LIGHT_DOMAIN, "turn_on", {
+                    "entity_id": entity_id,
+                    "brightness": brightness,
+                    "rgb_color": [255, 255, 255]  # Force white
+                }
+            )
 
     async def _calibrate_timing(self) -> None:
-        """Determine optimal timing by testing first light."""
+        """Determine optimal settle time for lights and sensor."""
         self.calibration_step = "calibrating_timing"
         await self.async_request_refresh()
         
@@ -524,149 +650,36 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         await self.async_request_refresh()
         
         self.light_contributions = {}
-        MIN_CONTRIBUTION_LUX = 10  # Minimum lux contribution to be considered useful
-        
-        _LOGGER.error("=== TESTING INDIVIDUAL LIGHTS ===")
-        _LOGGER.error("Testing %d lights for minimum %d lux contribution...", len(self.lights), MIN_CONTRIBUTION_LUX)
         
         for i, light_entity in enumerate(self.lights):
-            _LOGGER.info("Testing light %d/%d: %s", i+1, len(self.lights), light_entity)
+            _LOGGER.info("Testing light %d/%d: %s", i + 1, len(self.lights), light_entity)
             
             # Turn off all lights
             await self._set_all_lights(False)
             await asyncio.sleep(self.settle_time_seconds)
             base_lux = await self._read_sensor()
             
-            # Turn on this light with white color and full brightness
+            # Turn on this light
             await self._set_light_to_white(light_entity, 255)
             await asyncio.sleep(self.settle_time_seconds)
             with_light_lux = await self._read_sensor()
             
             contribution = with_light_lux - base_lux
             
-            # Only keep lights with meaningful contribution
-            if contribution >= MIN_CONTRIBUTION_LUX:
+            # Only include lights that contribute significantly (>10 lux threshold)
+            if contribution >= 10:
                 self.light_contributions[light_entity] = {
-                    "max_contribution": max(0, contribution),
-                    "base_reading": base_lux,
-                    "with_light_reading": with_light_lux,
-                    "linear_validated": True  # Will validate in next step
+                    "max_contribution": contribution,
+                    "base_lux": base_lux,
+                    "with_light_lux": with_light_lux,
+                    "linear_validated": True  # Will be updated in pair validation
                 }
-                _LOGGER.info("✓ %s: %.1f lux (INCLUDED)", light_entity, contribution)
+                _LOGGER.info("✓ %s contributes %.1f lux", light_entity, contribution)
             else:
-                _LOGGER.info("✗ %s: %.1f lux (EXCLUDED - below threshold)", light_entity, contribution)
+                _LOGGER.info("✗ %s contributes only %.1f lux (below threshold)", light_entity, contribution)
         
-        if not self.light_contributions:
-            raise HomeAssistantError("No lights found with sufficient contribution (>10 lux)")
-        
-        _LOGGER.error("✓ Found %d contributing lights out of %d tested", 
-                     len(self.light_contributions), len(self.lights))
-
-    async def _set_light_to_white(self, entity_id: str, brightness: int) -> None:
-        """Set light to white color at specified brightness with validation."""
-        try:
-            if brightness > 0:
-                # Get light state to check supported features
-                light_state = self.hass.states.get(entity_id)
-                if not light_state:
-                    _LOGGER.warning("Light %s not found when trying to set to white", entity_id)
-                    return
-                
-                supported_color_modes = light_state.attributes.get("supported_color_modes", [])
-                
-                # Build service call parameters - start with brightness only
-                service_data = {
-                    "entity_id": entity_id,
-                    "brightness": brightness
-                }
-                
-                # Add ONE color parameter based on priority: color_temp > rgb > hs
-                if "color_temp" in supported_color_modes:
-                    # Use new kelvin format instead of deprecated mireds
-                    service_data["color_temp_kelvin"] = 4000  # Neutral white
-                elif "rgb" in supported_color_modes:
-                    service_data["rgb_color"] = [255, 255, 255]
-                elif "hs" in supported_color_modes:
-                    service_data["hs_color"] = [0, 0]  # Hue=0, Saturation=0 = white
-                
-                await self.hass.services.async_call(
-                    "light", "turn_on",
-                    service_data,
-                    blocking=True
-                )
-                
-                # Validate the command worked
-                await self._validate_light_state_change(entity_id, expected_state=STATE_ON, retry_count=2)
-                
-            else:
-                await self.hass.services.async_call(
-                    "light", "turn_off",
-                    {"entity_id": entity_id},
-                    blocking=True
-                )
-                
-                # Validate the light actually turned off
-                await self._validate_light_state_change(entity_id, expected_state=STATE_OFF, retry_count=2)
-                
-        except Exception as err:
-            _LOGGER.warning("Failed to set light %s to white: %s, trying basic control", entity_id, err)
-            
-            # Fallback to basic brightness control
-            try:
-                if brightness > 0:
-                    await self.hass.services.async_call(
-                        "light", "turn_on",
-                        {"entity_id": entity_id, "brightness": brightness},
-                        blocking=True
-                    )
-                    await self._validate_light_state_change(entity_id, expected_state=STATE_ON, retry_count=2)
-                else:
-                    await self.hass.services.async_call(
-                        "light", "turn_off",
-                        {"entity_id": entity_id},
-                        blocking=True
-                    )
-                    await self._validate_light_state_change(entity_id, expected_state=STATE_OFF, retry_count=2)
-            except Exception as err2:
-                _LOGGER.error("Failed fallback control for light %s: %s", entity_id, err2)
-
-    async def _validate_light_state_change(self, entity_id: str, expected_state: str, retry_count: int = 2) -> bool:
-        """Validate that a light actually changed to the expected state."""
-        for attempt in range(retry_count + 1):
-            # Wait a bit for the change to take effect
-            await asyncio.sleep(1.0 + (attempt * 0.5))  # Increasing delay with retries
-            
-            current_state = self.hass.states.get(entity_id)
-            if current_state and current_state.state == expected_state:
-                if attempt > 0:
-                    _LOGGER.info("Light %s reached %s state after %d retries", entity_id, expected_state, attempt)
-                return True
-            
-            if attempt < retry_count:
-                _LOGGER.warning("Light %s failed to reach %s state (attempt %d/%d), retrying...", 
-                               entity_id, expected_state, attempt + 1, retry_count + 1)
-                
-                # Retry the command
-                if expected_state == STATE_ON:
-                    await self.hass.services.async_call(
-                        "light", "turn_on",
-                        {"entity_id": entity_id, "brightness": 255},
-                        blocking=True
-                    )
-                else:
-                    await self.hass.services.async_call(
-                        "light", "turn_off",
-                        {"entity_id": entity_id},
-                        blocking=True
-                    )
-        
-        # If we get here, validation failed
-        _LOGGER.error("CRITICAL: Light %s failed to reach %s state after %d attempts - this will invalidate calibration!", 
-                     entity_id, expected_state, retry_count + 1)
-        
-        current_state = self.hass.states.get(entity_id)
-        actual_state = current_state.state if current_state else "unknown"
-        raise HomeAssistantError(f"Light {entity_id} failed to respond - expected {expected_state}, got {actual_state}. Calibration aborted.")
+        _LOGGER.info("Light contribution testing complete: %d contributing lights found", 
+                    len(self.light_contributions))
 
     async def _validate_light_pairs(self) -> None:
         """Validate that light contributions are approximately additive."""
@@ -735,7 +748,52 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
         new_data = {**self.config_entry.data, "calibration": calibration_data}
         self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
         
+        # Set up state change listeners for contributing lights
+        await self._setup_light_state_listeners()
+        
+        # Force immediate data refresh to update sensors
+        await self.async_request_refresh()
+        
         _LOGGER.info("Calibration data saved successfully")
+
+    async def _setup_light_state_listeners(self) -> None:
+        """Set up state change listeners for contributing lights."""
+        # Clean up existing listeners first
+        await self._cleanup_state_listeners()
+        
+        if not self.light_contributions:
+            return
+            
+        _LOGGER.info("Setting up state listeners for %d contributing lights", len(self.light_contributions))
+        
+        from homeassistant.helpers.event import async_track_state_change_event
+        
+        def light_state_changed(event):
+            """Handle light state change - simple flag approach."""
+            entity_id = event.data.get("entity_id")
+            _LOGGER.debug("Contributing light %s changed, flagging for update", entity_id)
+            # Just set flag - coordinator will update on next cycle (every 10 seconds)
+            self._light_state_dirty = True
+        
+        # Track state changes for all contributing lights
+        contributing_entities = list(self.light_contributions.keys())
+        unsub = async_track_state_change_event(
+            self.hass,
+            contributing_entities,
+            light_state_changed
+        )
+        self._unsub_state_listeners.append(unsub)
+        
+        _LOGGER.info("State listeners set up for contributing lights: %s", contributing_entities)
+
+    async def _cleanup_state_listeners(self) -> None:
+        """Clean up state change listeners."""
+        count = len(self._unsub_state_listeners)
+        for unsub in self._unsub_state_listeners:
+            unsub()
+        self._unsub_state_listeners.clear()
+        if count > 0:
+            _LOGGER.debug("Cleaned up %d state listeners", count)
 
     async def _set_all_lights(self, state: bool) -> None:
         """Turn all contributing lights on (white) or off with validation."""
@@ -771,86 +829,3 @@ class AdaptiveELLCoordinator(DataUpdateCoordinator):
             raise HomeAssistantError(f"Lights failed to respond correctly: {failed_lights}. Calibration aborted.")
         
         _LOGGER.info("All %d lights successfully set to %s", len(lights_to_control), expected_state)
-
-    async def _capture_initial_light_states(self) -> None:
-        """Capture the current state of all lights before calibration."""
-        self.initial_light_states = {}
-        
-        _LOGGER.error("📸 Capturing initial light states...")
-        
-        for light_entity in self.lights:
-            light_state = self.hass.states.get(light_entity)
-            if light_state:
-                self.initial_light_states[light_entity] = {
-                    "state": light_state.state,
-                    "brightness": light_state.attributes.get("brightness"),
-                    "rgb_color": light_state.attributes.get("rgb_color"),
-                    "color_temp": light_state.attributes.get("color_temp"),
-                    "color_temp_kelvin": light_state.attributes.get("color_temp_kelvin"),
-                    "hs_color": light_state.attributes.get("hs_color"),
-                    "xy_color": light_state.attributes.get("xy_color"),
-                }
-                _LOGGER.info("Captured state for %s: %s", light_entity, light_state.state)
-
-    async def _restore_initial_light_states(self) -> None:
-        """Restore all lights to their original state before calibration."""
-        if not self.initial_light_states:
-            return
-            
-        _LOGGER.error("🔄 Restoring lights to original states...")
-        
-        for light_entity, original_state in self.initial_light_states.items():
-            try:
-                if original_state["state"] == STATE_OFF:
-                    # Simply turn off the light
-                    await self.hass.services.async_call(
-                        "light", "turn_off",
-                        {"entity_id": light_entity},
-                        blocking=True
-                    )
-                    _LOGGER.info("Restored %s: OFF", light_entity)
-                    
-                elif original_state["state"] == STATE_ON:
-                    # Build service call to restore original on state
-                    service_data = {"entity_id": light_entity}
-                    
-                    # Add brightness if it was set
-                    if original_state["brightness"] is not None:
-                        service_data["brightness"] = original_state["brightness"]
-                    
-                    # Add color information - prioritize the most specific format available
-                    if original_state["color_temp_kelvin"] is not None:
-                        service_data["color_temp_kelvin"] = original_state["color_temp_kelvin"]
-                    elif original_state["color_temp"] is not None:
-                        service_data["color_temp_kelvin"] = round(1000000 / original_state["color_temp"])  # Convert mireds to kelvin
-                    elif original_state["rgb_color"] is not None:
-                        service_data["rgb_color"] = original_state["rgb_color"]
-                    elif original_state["hs_color"] is not None:
-                        service_data["hs_color"] = original_state["hs_color"]
-                    elif original_state["xy_color"] is not None:
-                        service_data["xy_color"] = original_state["xy_color"]
-                    
-                    await self.hass.services.async_call(
-                        "light", "turn_on",
-                        service_data,
-                        blocking=True
-                    )
-                    _LOGGER.info("Restored %s: ON with original settings", light_entity)
-                    
-            except Exception as err:
-                _LOGGER.warning("Failed to restore %s: %s", light_entity, err)
-                
-        # Clear the stored states
-        self.initial_light_states = {}
-        _LOGGER.error("✅ Light state restoration complete")
-
-    async def _read_sensor(self) -> float:
-        """Read current sensor value."""
-        sensor_state = self.hass.states.get(self.sensor_entity)
-        if not sensor_state or sensor_state.state in [STATE_UNAVAILABLE, STATE_UNKNOWN]:
-            raise HomeAssistantError(f"Sensor {self.sensor_entity} unavailable")
-        
-        try:
-            return float(sensor_state.state)
-        except (ValueError, TypeError):
-            raise HomeAssistantError(f"Sensor {self.sensor_entity} returned non-numeric value: {sensor_state.state}")
